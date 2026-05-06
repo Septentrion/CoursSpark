@@ -1,0 +1,11 @@
+services:
+  pyspark:
+    build: .
+    container_name: spark-cours
+    volumes:
+      - ./exercices:/cours-spark/scripts
+      - ./notebooks:/cours-spark/notebooks
+      - ./data:/cours-spark/data
+    ports:
+      - "8888:8888"
+      - "4040:4040"
