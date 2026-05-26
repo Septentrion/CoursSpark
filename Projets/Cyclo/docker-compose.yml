@@ -1,0 +1,182 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ClimaCity Paris -- docker-compose.yml
+#
+# Services :
+#   jupyter  -- JupyterLab avec PySpark 3.5, Delta Lake 3.2, MLflow client
+#   mlflow   -- Serveur MLflow (interface de suivi des expériences)
+#
+# Démarrage :
+#   docker compose up -d
+#
+# Arrêt :
+#   docker compose down
+#
+# Reconstruction de l'image (après modification du Dockerfile) :
+#   docker compose build --no-cache jupyter
+#
+# Ports exposés sur l'hôte :
+#   8888  →  JupyterLab       http://localhost:8888  (token : climacity)
+#   4040  →  Spark UI         http://localhost:4040  (après SparkSession.builder...getOrCreate())
+#   5000  →  MLflow UI        http://localhost:5000
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── JupyterLab + PySpark ──────────────────────────────────────────────────
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: climacity-jupyter:latest
+    container_name: climacity-jupyter
+    hostname: climacity-jupyter
+
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"      # JupyterLab
+      - "${SPARK_UI_PORT:-4040}:4040"     # Spark UI (session principale)
+      - "4041:4041"                        # Spark UI (session secondaire éventuelle)
+
+    volumes:
+      # Notebooks : modifiables depuis l'hôte, persistés entre redémarrages
+      - ./notebooks:/home/jovyan/notebooks
+
+      # Scripts utilitaires (simulateur de flux, collecte de données…)
+      - ./scripts:/home/jovyan/scripts
+
+      # Données : répertoire partagé entre hôte et conteneur
+      # Les étudiants téléchargent les données depuis le notebook,
+      # elles sont immédiatement visibles sur l'hôte et vice-versa.
+      - ./data:/home/jovyan/data
+
+      # Cache Maven/Ivy pour Delta Lake : évite de retélécharger les JARs
+      # si l'image est reconstruite sans --no-cache
+      - ivy_cache:/home/jovyan/.ivy2
+
+    environment:
+      # ── Jupyter ──
+      JUPYTER_TOKEN: "${JUPYTER_TOKEN:-climacity}"
+      JUPYTER_PORT: "${JUPYTER_PORT:-8888}"
+      SPARK_UI_PORT: "${SPARK_UI_PORT:-4040}"
+
+      # ── MLflow ──
+      # Le conteneur jupyter pointe vers le service mlflow du même réseau
+      MLFLOW_TRACKING_URI: "http://mlflow:${MLFLOW_PORT:-5000}"
+      MLFLOW_PORT: "${MLFLOW_PORT:-5000}"
+
+      # ── Spark (surcharge de spark-defaults.conf) ──
+      # Ces variables sont lues par PySpark au démarrage de la JVM
+      SPARK_DRIVER_MEMORY: "${SPARK_DRIVER_MEMORY:-4g}"
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+
+      # ── Java ──
+      # Désactive les avertissements de modules Java 17 (normaux avec Spark 3.5)
+      JAVA_OPTS: >-
+        --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+        --add-opens=java.base/java.lang=ALL-UNNAMED
+        --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+        --add-opens=java.base/java.io=ALL-UNNAMED
+        --add-opens=java.base/java.net=ALL-UNNAMED
+        --add-opens=java.base/java.nio=ALL-UNNAMED
+        --add-opens=java.base/java.util=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+
+    # ── Ressources ────────────────────────────────────────────────────────────
+    # Adaptez ces valeurs à votre machine.
+    # Minimum recommandé : 6g de mémoire, 2 CPU.
+    # Sur un laptop 8 Go RAM : 6g / 2 CPU.
+    # Sur un laptop 16 Go RAM : 8g / 4 CPU.
+    deploy:
+      resources:
+        limits:
+          memory: "${DOCKER_MEMORY_LIMIT:-6g}"
+          cpus: "${DOCKER_CPU_LIMIT:-2}"
+        reservations:
+          memory: 3g
+
+    # ── Dépendances ───────────────────────────────────────────────────────────
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+    networks:
+      - climacity-net
+
+    # ── Relance automatique ───────────────────────────────────────────────────
+    restart: unless-stopped
+
+    # ── Health check ──────────────────────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "curl", "-f",
+             "http://localhost:${JUPYTER_PORT:-8888}/api/status",
+             "-H", "Authorization: token ${JUPYTER_TOKEN:-climacity}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+
+  # ── Serveur MLflow ────────────────────────────────────────────────────────
+  mlflow:
+    image: python:3.11-slim
+    container_name: climacity-mlflow
+    hostname: climacity-mlflow
+
+    # Installation de MLflow et démarrage du serveur en une seule commande
+    # Le volume mlflow_data persiste les runs entre les redémarrages
+    command: >
+      bash -c "
+        pip install --quiet mlflow==${MLFLOW_VERSION:-2.17.2} &&
+        mlflow server
+          --host 0.0.0.0
+          --port ${MLFLOW_PORT:-5000}
+          --backend-store-uri /mlflow/mlruns
+          --default-artifact-root /mlflow/artifacts
+          --serve-artifacts
+      "
+
+    ports:
+      - "${MLFLOW_PORT:-5000}:${MLFLOW_PORT:-5000}"
+
+    volumes:
+      - mlflow_data:/mlflow
+
+    environment:
+      MLFLOW_PORT: "${MLFLOW_PORT:-5000}"
+      MLFLOW_VERSION: "${MLFLOW_VERSION:-2.17.2}"
+
+    networks:
+      - climacity-net
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f",
+             "http://localhost:${MLFLOW_PORT:-5000}/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+
+# ── Volumes nommés ────────────────────────────────────────────────────────────
+volumes:
+  # Données MLflow : runs, métriques, artefacts (modèles sauvegardés)
+  mlflow_data:
+    driver: local
+    name: climacity_mlflow_data
+
+  # Cache des JARs Ivy/Maven (accélère les redémarrages)
+  ivy_cache:
+    driver: local
+    name: climacity_ivy_cache
+
+
+# ── Réseau interne ────────────────────────────────────────────────────────────
+# Les deux services communiquent par leur nom d'hôte (jupyter, mlflow).
+# Le réseau est isolé de l'hôte sauf sur les ports explicitement exposés.
+networks:
+  climacity-net:
+    driver: bridge
+    name: climacity-network
